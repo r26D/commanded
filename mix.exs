@@ -1,7 +1,7 @@
 defmodule Commanded.Mixfile do
   use Mix.Project
 
-  @version "1.0.0"
+  @version "1.2.0"
 
   def project do
     [
@@ -25,10 +25,13 @@ defmodule Commanded.Mixfile do
 
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: extra_applications(Mix.env()),
       mod: {Commanded, []}
     ]
   end
+
+  defp extra_applications(:test), do: [:logger, :phoenix_pubsub]
+  defp extra_applications(_env), do: [:logger]
 
   defp elixirc_paths(env) when env in [:bench, :test],
     do: [
@@ -44,6 +47,7 @@ defmodule Commanded.Mixfile do
       "test/process_managers/support",
       "test/pubsub/support",
       "test/registration/support",
+      "test/subscriptions/support",
       "test/support"
     ]
 
@@ -51,16 +55,22 @@ defmodule Commanded.Mixfile do
 
   defp deps do
     [
+      {:backoff, "~> 1.1"},
       {:elixir_uuid, "~> 1.2"},
 
+      # Telemetry
+      {:telemetry, "~> 0.4.2"},
+      {:telemetry_registry, "~> 0.2.1"},
+
       # Optional dependencies
-      {:jason, "~> 1.1", optional: true},
-      {:phoenix_pubsub, "~> 1.1", optional: true},
+      {:jason, "~> 1.2", optional: true},
+      {:phoenix_pubsub, "~> 2.0", optional: true},
 
       # Build and test tools
       {:benchfella, "~> 0.3", only: :bench},
-      {:dialyxir, "~> 1.0.0-rc.7", only: :dev, runtime: false},
-      {:ex_doc, "~> 0.21", only: :dev},
+      {:dialyxir, "~> 1.0", only: :dev, runtime: false},
+      {:ex_doc, ">= 0.0.0", only: :dev},
+      {:local_cluster, "~> 1.1", only: :test, runtime: false},
       {:mix_test_watch, "~> 1.0", only: :dev},
       {:mox, "~> 0.5", only: [:bench, :test]}
     ]
@@ -149,6 +159,7 @@ defmodule Commanded.Mixfile do
         ],
         "Event Store": [
           Commanded.EventStore,
+          Commanded.EventStore.Adapter,
           Commanded.EventStore.Adapters.InMemory,
           Commanded.EventStore.EventData,
           Commanded.EventStore.RecordedEvent,
@@ -157,12 +168,15 @@ defmodule Commanded.Mixfile do
         ],
         "Pub Sub": [
           Commanded.PubSub,
+          Commanded.PubSub.Adapter,
           Commanded.PubSub.LocalPubSub,
           Commanded.PubSub.PhoenixPubSub
         ],
         Registry: [
           Commanded.Registration,
-          Commanded.Registration.LocalRegistry
+          Commanded.Registration.Adapter,
+          Commanded.Registration.LocalRegistry,
+          Commanded.Registration.GlobalRegistry
         ],
         Serialization: [
           Commanded.Serialization.JsonDecoder,
@@ -183,6 +197,18 @@ defmodule Commanded.Mixfile do
           Commanded.AggregateCase,
           Commanded.Assertions.EventAssertions
         ]
+      ],
+      nest_modules_by_prefix: [
+        Commanded.Aggregate,
+        Commanded.Aggregates,
+        Commanded.Commands,
+        Commanded.Event,
+        Commanded.ProcessManagers,
+        Commanded.EventStore,
+        Commanded.PubSub,
+        Commanded.Registration,
+        Commanded.Serialization,
+        Commanded.Middleware
       ]
     ]
   end

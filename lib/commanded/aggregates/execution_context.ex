@@ -20,10 +20,15 @@ defmodule Commanded.Aggregates.ExecutionContext do
     - `handler` - the module that handles the command. It may be either the
       aggregate module itself or a separate command handler module.
 
-    - `function` - the name of function, as an atom, that handles the command.
+    - `function` - the name of the function, as an atom, that handles the command.
       The default value is `:execute`, used to support command dispatch directly
       to the aggregate module. For command handlers the `:handle` function is
       used.
+
+    - `before_execute` - the name of the function, as an atom, that prepares the
+      command before execution, called just before `function`. The default value
+      is `nil`, disabling it. It should return `:ok` on success or `{:error, any()}`
+      to cancel the dispatch.
 
     - `lifespan` - a module implementing the `Commanded.Aggregates.AggregateLifespan`
       behaviour to control the aggregate instance process lifespan. The default
@@ -41,8 +46,9 @@ defmodule Commanded.Aggregates.ExecutionContext do
     :command,
     :causation_id,
     :correlation_id,
-    :function,
     :handler,
+    :function,
+    before_execute: nil,
     retry_attempts: 0,
     returning: false,
     lifespan: DefaultLifespan,
@@ -63,7 +69,7 @@ defmodule Commanded.Aggregates.ExecutionContext do
     {:ok, context}
   end
 
-  def format_reply(reply, %ExecutionContext{} = context, %Aggregate{} = aggregate) do
+  def format_reply(result, %ExecutionContext{} = context, %Aggregate{} = aggregate) do
     %Aggregate{
       aggregate_uuid: aggregate_uuid,
       aggregate_state: aggregate_state,
@@ -72,7 +78,7 @@ defmodule Commanded.Aggregates.ExecutionContext do
 
     %ExecutionContext{metadata: metadata, returning: returning} = context
 
-    with {:ok, events} <- reply do
+    with {:ok, events} <- result do
       case returning do
         :aggregate_state ->
           {:ok, aggregate_version, events, aggregate_state}
@@ -94,6 +100,9 @@ defmodule Commanded.Aggregates.ExecutionContext do
         false ->
           {:ok, aggregate_version, events}
       end
+    else
+      {:error, _error} = reply -> reply
+      {:error, error, _stacktrace} -> {:error, error}
     end
   end
 end

@@ -3,10 +3,12 @@
 locals_without_parens = [
   dispatch: 2,
   identify: 2,
-  middleware: 1
+  middleware: 1,
+  router: 1
 ]
 
 [
+  import_deps: [:telemetry_registry],
   inputs: [
     "{mix,.formatter}.exs",
     "{config,lib,test}/**/*.{ex,exs}"

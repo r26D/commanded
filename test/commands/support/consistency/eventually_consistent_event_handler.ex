@@ -1,31 +1,24 @@
 defmodule Commanded.Commands.EventuallyConsistentEventHandler do
   use Commanded.Event.Handler,
-    application: Commanded.DefaultApp,
+    application: Commanded.Commands.ConsistencyApp,
     name: "EventuallyConsistentEventHandler",
     consistency: :eventual
 
-  alias Commanded.Commands.{
-    ConsistencyAggregateRoot,
-    ConsistencyRouter
-  }
+  alias Commanded.Commands.ConsistencyApp
+  alias Commanded.Commands.ConsistencyAggregateRoot
+  alias ConsistencyAggregateRoot.{ConsistencyCommand, ConsistencyEvent, DispatchRequestedEvent}
 
-  alias ConsistencyAggregateRoot.{
-    ConsistencyCommand,
-    ConsistencyEvent,
-    DispatchRequestedEvent
-  }
-
+  # Simulate slow event handler.
   def handle(%ConsistencyEvent{}, _metadata) do
-    # Simulate slow event handler
     :timer.sleep(:infinity)
 
     :ok
   end
 
-  # Handle event by dispatching a command.
+  # Dispatch a command.
   def handle(%DispatchRequestedEvent{uuid: uuid, delay: delay}, _metadata) do
     command = %ConsistencyCommand{uuid: uuid, delay: delay}
 
-    ConsistencyRouter.dispatch(command, application: Commanded.DefaultApp)
+    ConsistencyApp.dispatch(command)
   end
 end

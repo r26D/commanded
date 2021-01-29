@@ -2,10 +2,47 @@
 
 ## Next release
 
+- Allow command identity to be provided during dispatch ([#406](https://github.com/commanded/commanded/pull/406)).
+- Define `Commanded.Telemetry` module to emit consistent telemetry events ([#414](https://github.com/commanded/commanded/pull/414)).
+- Telemetry `[:commanded, :aggregate, :execute]` events ([#407](https://github.com/commanded/commanded/pull/407))
+- Telemetry `[:commanded, :event, :handle]` events ([#408](https://github.com/commanded/commanded/pull/408))
+- Telemetry `[:commanded, :process_manager, :handle]` events ([#418](https://github.com/commanded/commanded/pull/418))
+
+## v1.2.0
+
+### Enhancements
+
+- Add `init/1` callback function to event handlers and process managers ([#393](https://github.com/commanded/commanded/pull/393)).
+- Include `application` and `handler_name` as additional event handler metadata ([#396](https://github.com/commanded/commanded/pull/396)).
+- Allow `GenServer` start options to be provided when starting event handlers and process managers ([#398](https://github.com/commanded/commanded/pull/398)).
+- Add `hibernate_after` option to application config ([#399](https://github.com/commanded/commanded/pull/399)).
+- Add support for providing adapter-specific event store subscription options ([#391](https://github.com/commanded/commanded/pull/391)).
+- Support custom state for event handlers ([#400](https://github.com/commanded/commanded/pull/400)).
+- Allow event handlers and process manager `error` callback to return failure context struct ([#397](https://github.com/commanded/commanded/issues/397)).
+- Allow a before execute function to be defined which is called with the command dispatch execution context and aggregate state before ([#402](https://github.com/commanded/commanded/pull/402)).
+
+### Bug fixes
+
+- Allow process manager `error/3` callback to return `:skip` for failed commands, not just failed events ([#362](https://github.com/commanded/commanded/issues/362)).
+
+---
+
+## v1.1.1
+
+### Enhancements
+
+- Capture exception on Process Manager `apply/2` and call `error/3` callback functions ([#380](https://github.com/commanded/commanded/pull/380)).
+- Include metadata in upcaster protocol ([#389](https://github.com/commanded/commanded/pull/389)).
+
+### Bug fixes
+
+- Fix `Commanded.Aggregate.Multi.execute/2` calls which return ` Multi` struct ([#385](https://github.com/commanded/commanded/pull/385])).
+
+## v1.1.0
+
 ### Enhancements
 
 - Dynamic Commanded applications ([#324](https://github.com/commanded/commanded/pull/324)).
-- Command dispatch return ([#331](https://github.com/commanded/commanded/pull/331)).
 - Log and ignore unexpected messages received by event handlers and process manager instances ([#333](https://github.com/commanded/commanded/pull/333))
 - Process manager `identity/0` function ([#334](https://github.com/commanded/commanded/pull/334)).
 - Extend `Commanded.AggregateCase` ExUnit case template to support `Commanded.Aggregate.Multi`.
@@ -14,11 +51,32 @@
 - Add stacktraces to EventHandler error logging ([#340](https://github.com/commanded/commanded/pull/340))
 - `refute_receive_event/4` only tests newly created events ([#347](https://github.com/commanded/commanded/pull/347)).
 - Allow Commanded Application name to be set dynamically in middleware ([#352](https://github.com/commanded/commanded/pull/352)).
+- Remove router module compile-time checking ([#363](https://github.com/commanded/commanded/pull/363)).
+- Reduce memory consumption during aggregate state rebuild ([#368](https://github.com/commanded/commanded/pull/368)).
+- Upgrade to `phoenix_pubsub` to 2.0 ([#365](https://github.com/commanded/commanded/pull/365)).
+- Ignore `:not_found` error when reseting InMemory event store ([#354](https://github.com/commanded/commanded/pull/354)).
+- Add `router/1` to `locals_without_parens` in Mix format config ([#351](https://github.com/commanded/commanded/pull/351)).
+- Include stacktrace in event handler and process manager `error` callback functions ([#342](https://github.com/commanded/commanded/pull/342)).
+- Call event handler's `error/3` callback function when `handle/2` function returns an invalid value ([#372](https://github.com/commanded/commanded/pull/372)).
 
 ### Bug fixes
 
 - Fixes the typespec for command dispatch ([#325](https://github.com/commanded/commanded/pull/325)).
 - Process manager stops if `interested?/1` returns an empty list ([#335](https://github.com/commanded/commanded/pull/335)).
+
+---
+
+## v1.0.1
+
+### Enhancements
+
+- Global registry using Erlang's `:global` module ([#344](https://github.com/commanded/commanded/pull/344)).
+- Command dispatch return ([#331](https://github.com/commanded/commanded/pull/331)).
+
+### Bug fixes
+
+- Fix distributed subscription registration bug ([#345](https://github.com/commanded/commanded/pull/345)).
+- Retry event handler and process manager subscriptions on error ([#348](https://github.com/commanded/commanded/pull/348)).
 
 ## v1.0.0
 
@@ -119,7 +177,7 @@
 
   ```elixir
   defp deps do
-    [{:jason, "~> 1.1"}]
+    [{:jason, "~> 1.2"}]
   end
   ```
 

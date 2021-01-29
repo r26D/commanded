@@ -1,4 +1,55 @@
 defmodule Commanded.Aggregates.Aggregate do
+  use TelemetryRegistry
+  use GenServer, restart: :temporary
+  use Commanded.Registration
+
+  telemetry_event(%{
+    event: [:commanded, :aggregate, :execute, :start],
+    description: "Emitted when an aggregate starts executing a command",
+    measurements: "%{system_time: integer()}",
+    metadata: """
+    %{application: Commanded.Application.t(),
+      aggregate_uuid: String.t(),
+      aggregate_state: struct(),
+      aggregate_version: non_neg_integer(),
+      caller: pid(),
+      execution_context: Commanded.Aggregates.ExecutionContext.t()}
+    """
+  })
+
+  telemetry_event(%{
+    event: [:commanded, :aggregate, :execute, :stop],
+    description: "Emitted when an aggregate stops executing a command",
+    measurements: "%{duration: non_neg_integer()}",
+    metadata: """
+    %{application: Commanded.Application.t(),
+      aggregate_uuid: String.t(),
+      aggregate_state: struct(),
+      aggregate_version: non_neg_integer(),
+      caller: pid(),
+      execution_context: Commanded.Aggregates.ExecutionContext.t(),
+      events: [map()],
+      error: nil | any()}
+    """
+  })
+
+  telemetry_event(%{
+    event: [:commanded, :aggregate, :execute, :exception],
+    description: "Emitted when an aggregate raises an exception",
+    measurements: "%{duration: non_neg_integer()}",
+    metadata: """
+    %{application: Commanded.Application.t(),
+      aggregate_uuid: String.t(),
+      aggregate_state: struct(),
+      aggregate_version: non_neg_integer(),
+      caller: pid(),
+      execution_context: Commanded.Aggregates.ExecutionContext.t(),
+      kind: :throw | :error | :exit,
+      reason: any(),
+      stacktrace: list()}
+    """
+  })
+
   @moduledoc """
   Aggregate is a `GenServer` process used to provide access to an
   instance of an event sourced aggregate.
@@ -40,10 +91,11 @@ defmodule Commanded.Aggregates.Aggregate do
           ]
         }
 
-  """
+  ## Telemetry
 
-  use GenServer, restart: :temporary
-  use Commanded.Registration
+  #{telemetry_docs()}
+
+  """
 
   require Logger
 
@@ -56,6 +108,7 @@ defmodule Commanded.Aggregates.Aggregate do
   alias Commanded.EventStore.SnapshotData
   alias Commanded.Registration
   alias Commanded.Snapshotting
+  alias Commanded.Telemetry
 
   @read_event_batch_size 100
 
@@ -69,28 +122,31 @@ defmodule Commanded.Aggregates.Aggregate do
     lifespan_timeout: :infinity
   ]
 
-  def start_link(config, args) do
-    aggregate_module = Keyword.fetch!(args, :aggregate_module)
-    aggregate_uuid = Keyword.fetch!(args, :aggregate_uuid)
+  def start_link(config, opts) do
+    {start_opts, aggregate_opts} =
+      Keyword.split(opts, [:debug, :name, :timeout, :spawn_opt, :hibernate_after])
 
-    unless is_atom(aggregate_module) and is_binary(aggregate_uuid) do
-      raise "aggregate_module must be an atom and aggregate_uuid must be a string"
-    end
+    aggregate_module = Keyword.fetch!(aggregate_opts, :aggregate_module)
+    aggregate_uuid = Keyword.fetch!(aggregate_opts, :aggregate_uuid)
+
+    unless is_atom(aggregate_module),
+      do: raise(ArgumentError, message: "aggregate module must be an atom")
+
+    unless is_binary(aggregate_uuid),
+      do: raise(ArgumentError, message: "aggregate identity must be a string")
 
     application = Keyword.fetch!(config, :application)
     snapshotting = Keyword.get(config, :snapshotting, %{})
     snapshot_options = Map.get(snapshotting, aggregate_module, [])
 
-    aggregate = %Aggregate{
+    state = %Aggregate{
       application: application,
       aggregate_module: aggregate_module,
       aggregate_uuid: aggregate_uuid,
       snapshotting: Snapshotting.new(application, aggregate_uuid, snapshot_options)
     }
 
-    opts = [name: args[:name]]
-
-    GenServer.start_link(__MODULE__, aggregate, opts)
+    GenServer.start_link(__MODULE__, state, start_opts)
   end
 
   @doc false
@@ -212,8 +268,8 @@ defmodule Commanded.Aggregates.Aggregate do
       end
 
     case lifespan_timeout do
-      :stop ->
-        {:stop, :normal, state}
+      {:stop, reason} ->
+        {:stop, reason, state}
 
       lifespan_timeout ->
         {:noreply, state, lifespan_timeout}
@@ -222,13 +278,16 @@ defmodule Commanded.Aggregates.Aggregate do
 
   @doc false
   @impl GenServer
-  def handle_call({:execute_command, %ExecutionContext{} = context}, _from, %Aggregate{} = state) do
+  def handle_call({:execute_command, %ExecutionContext{} = context}, from, %Aggregate{} = state) do
     %ExecutionContext{lifespan: lifespan, command: command} = context
 
-    {reply, state} = execute_command(context, state)
+    telemetry_metadata = telemetry_metadata(context, from, state)
+    start_time = telemetry_start(telemetry_metadata)
+
+    {result, state} = execute_command(context, state)
 
     lifespan_timeout =
-      case reply do
+      case result do
         {:ok, []} ->
           aggregate_lifespan_timeout(lifespan, :after_command, command)
 
@@ -237,24 +296,33 @@ defmodule Commanded.Aggregates.Aggregate do
 
         {:error, error} ->
           aggregate_lifespan_timeout(lifespan, :after_error, error)
+
+        {:error, error, _stacktrace} ->
+          aggregate_lifespan_timeout(lifespan, :after_error, error)
       end
 
-    reply = ExecutionContext.format_reply(reply, context, state)
+    formatted_reply = ExecutionContext.format_reply(result, context, state)
 
     state = %Aggregate{state | lifespan_timeout: lifespan_timeout}
 
     %Aggregate{aggregate_version: aggregate_version, snapshotting: snapshotting} = state
 
-    if Snapshotting.snapshot_required?(snapshotting, aggregate_version) do
-      :ok = GenServer.cast(self(), :take_snapshot)
+    response =
+      if Snapshotting.snapshot_required?(snapshotting, aggregate_version) do
+        :ok = GenServer.cast(self(), :take_snapshot)
 
-      {:reply, reply, state}
-    else
-      case lifespan_timeout do
-        :stop -> {:stop, :normal, reply, state}
-        lifespan_timeout -> {:reply, reply, state, lifespan_timeout}
+        {:reply, formatted_reply, state}
+      else
+        case lifespan_timeout do
+          {:stop, reason} -> {:stop, reason, formatted_reply, state}
+          lifespan_timeout -> {:reply, formatted_reply, state, lifespan_timeout}
+        end
       end
-    end
+
+    telemetry_metadata = telemetry_metadata(context, from, state)
+    telemetry_stop(start_time, telemetry_metadata, result)
+
+    response
   end
 
   @doc false
@@ -276,14 +344,14 @@ defmodule Commanded.Aggregates.Aggregate do
   @doc false
   @impl GenServer
   def handle_info({:events, events}, %Aggregate{} = state) do
-    %Aggregate{lifespan_timeout: lifespan_timeout} = state
+    %Aggregate{application: application, lifespan_timeout: lifespan_timeout} = state
 
     Logger.debug(fn -> describe(state) <> " received events: #{inspect(events)}" end)
 
     try do
       state =
         events
-        |> Upcast.upcast_event_stream()
+        |> Upcast.upcast_event_stream(additional_metadata: %{application: application})
         |> Enum.reduce(state, &handle_event/2)
 
       state = Enum.reduce(events, state, &handle_event/2)
@@ -391,44 +459,33 @@ defmodule Commanded.Aggregates.Aggregate do
     end
   end
 
-  # Rebuild aggregate state from a `Stream` of its events
+  # Rebuild aggregate state from a `Stream` of its events.
   defp rebuild_from_event_stream(event_stream, %Aggregate{} = state) do
-    %Aggregate{aggregate_module: aggregate_module} = state
+    Enum.reduce(event_stream, state, fn event, state ->
+      %RecordedEvent{data: data, stream_version: stream_version} = event
+      %Aggregate{aggregate_module: aggregate_module, aggregate_state: aggregate_state} = state
 
-    event_stream
-    |> Stream.map(fn event ->
-      {event.data, event.stream_version}
+      %Aggregate{
+        state
+        | aggregate_version: stream_version,
+          aggregate_state: aggregate_module.apply(aggregate_state, data)
+      }
     end)
-    |> Stream.transform(state, fn {event, stream_version}, state ->
-      case event do
-        nil ->
-          {:halt, state}
-
-        event ->
-          state = %Aggregate{
-            state
-            | aggregate_version: stream_version,
-              aggregate_state: aggregate_module.apply(state.aggregate_state, event)
-          }
-
-          {[state], state}
-      end
-    end)
-    |> Stream.take(-1)
-    |> Enum.at(0)
-    |> case do
-      nil -> state
-      state -> state
-    end
   end
 
-  defp aggregate_lifespan_timeout(lifespan, timeout_function_name, args) do
-    # Take the last event or the command/error
+  defp aggregate_lifespan_timeout(lifespan, function_name, args) do
+    # Take the last event or the command or error
     args = args |> List.wrap() |> Enum.take(-1)
 
-    case apply(lifespan, timeout_function_name, args) do
-      timeout when timeout in [:infinity, :hibernate, :stop] ->
+    case apply(lifespan, function_name, args) do
+      timeout when timeout in [:infinity, :hibernate] ->
         timeout
+
+      :stop ->
+        {:stop, :normal}
+
+      {:stop, _reason} = reply ->
+        reply
 
       timeout when is_integer(timeout) and timeout >= 0 ->
         timeout
@@ -437,7 +494,7 @@ defmodule Commanded.Aggregates.Aggregate do
         Logger.warn(fn ->
           "Invalid timeout for aggregate lifespan " <>
             inspect(lifespan) <>
-            ", expected a non-negative integer, `:infinity`, `:hibernate`, or `:stop` but got: " <>
+            ", expected a non-negative integer, `:infinity`, `:hibernate`, `:stop`, or `{:stop, reason}` but got: " <>
             inspect(invalid)
         end)
 
@@ -445,34 +502,53 @@ defmodule Commanded.Aggregates.Aggregate do
     end
   end
 
+  defp before_execute_command(_aggregate_state, %ExecutionContext{before_execute: nil}), do: :ok
+
+  defp before_execute_command(aggregate_state, %ExecutionContext{} = context) do
+    %ExecutionContext{handler: handler, before_execute: before_execute} = context
+
+    Kernel.apply(handler, before_execute, [aggregate_state, context])
+  end
+
   defp execute_command(%ExecutionContext{} = context, %Aggregate{} = state) do
     %ExecutionContext{command: command, handler: handler, function: function} = context
     %Aggregate{aggregate_state: aggregate_state} = state
 
-    Logger.debug(fn -> describe(state) <> " executing command: #{inspect(command)}" end)
+    Logger.debug(fn -> describe(state) <> " executing command: " <> inspect(command) end)
 
-    case Kernel.apply(handler, function, [aggregate_state, command]) do
+    with :ok <- before_execute_command(aggregate_state, context) do
+      case Kernel.apply(handler, function, [aggregate_state, command]) do
+        {:error, _error} = reply ->
+          {reply, state}
+
+        none when none in [:ok, nil, []] ->
+          {{:ok, []}, state}
+
+        %Commanded.Aggregate.Multi{} = multi ->
+          case Commanded.Aggregate.Multi.run(multi) do
+            {:error, _error} = reply ->
+              {reply, state}
+
+            {aggregate_state, pending_events} ->
+              persist_events(pending_events, aggregate_state, context, state)
+          end
+
+        {:ok, pending_events} ->
+          apply_and_persist_events(pending_events, context, state)
+
+        pending_events ->
+          apply_and_persist_events(pending_events, context, state)
+      end
+    else
       {:error, _error} = reply ->
         {reply, state}
-
-      none when none in [:ok, nil, []] ->
-        {{:ok, []}, state}
-
-      %Commanded.Aggregate.Multi{} = multi ->
-        case Commanded.Aggregate.Multi.run(multi) do
-          {:error, _error} = reply ->
-            {reply, state}
-
-          {aggregate_state, pending_events} ->
-            persist_events(pending_events, aggregate_state, context, state)
-        end
-
-      {:ok, pending_events} ->
-        apply_and_persist_events(pending_events, context, state)
-
-      pending_events ->
-        apply_and_persist_events(pending_events, context, state)
     end
+  rescue
+    error ->
+      stacktrace = __STACKTRACE__
+      Logger.error(Exception.format(:error, error, stacktrace))
+
+      {{:error, error, stacktrace}, state}
   end
 
   defp apply_and_persist_events(pending_events, context, %Aggregate{} = state) do
@@ -549,6 +625,52 @@ defmodule Commanded.Aggregates.Aggregate do
       )
 
     EventStore.append_to_stream(application, aggregate_uuid, expected_version, event_data)
+  end
+
+  defp telemetry_start(telemetry_metadata) do
+    Telemetry.start([:commanded, :aggregate, :execute], telemetry_metadata)
+  end
+
+  defp telemetry_stop(start_time, telemetry_metadata, result) do
+    event_prefix = [:commanded, :aggregate, :execute]
+
+    case result do
+      {:ok, events} ->
+        Telemetry.stop(event_prefix, start_time, Map.put(telemetry_metadata, :events, events))
+
+      {:error, error} ->
+        Telemetry.stop(event_prefix, start_time, Map.put(telemetry_metadata, :error, error))
+
+      {:error, error, stacktrace} ->
+        Telemetry.exception(
+          event_prefix,
+          start_time,
+          :error,
+          error,
+          stacktrace,
+          telemetry_metadata
+        )
+    end
+  end
+
+  defp telemetry_metadata(%ExecutionContext{} = context, from, %Aggregate{} = state) do
+    %Aggregate{
+      application: application,
+      aggregate_uuid: aggregate_uuid,
+      aggregate_state: aggregate_state,
+      aggregate_version: aggregate_version
+    } = state
+
+    {pid, _ref} = from
+
+    %{
+      application: application,
+      aggregate_uuid: aggregate_uuid,
+      aggregate_state: aggregate_state,
+      aggregate_version: aggregate_version,
+      caller: pid,
+      execution_context: context
+    }
   end
 
   defp via_name(application, aggregate_module, aggregate_uuid) do

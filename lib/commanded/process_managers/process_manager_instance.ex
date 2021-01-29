@@ -9,6 +9,7 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
   alias Commanded.ProcessManagers.{ProcessRouter, FailureContext}
   alias Commanded.EventStore
   alias Commanded.EventStore.{RecordedEvent, SnapshotData}
+  alias Commanded.Telemetry
 
   defmodule State do
     @moduledoc false
@@ -137,9 +138,10 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
   """
   @impl GenServer
   def handle_cast({:process_event, event}, %State{} = state) do
-    case event_already_seen?(event, state) do
-      true -> process_seen_event(event, state)
-      false -> process_unseen_event(event, state)
+    if event_already_seen?(event, state) do
+      process_seen_event(event, state)
+    else
+      process_unseen_event(event, state)
     end
   end
 
@@ -169,11 +171,16 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
     event_number <= last_seen_event
   end
 
-  # Already seen event, so just ack
+  # Already seen event, so just ack.
   defp process_seen_event(%RecordedEvent{} = event, %State{} = state) do
     %State{idle_timeout: idle_timeout} = state
 
+    telemetry_metadata = telemetry_metadata(event, state)
+    start_time = telemetry_start(telemetry_metadata)
+
     :ok = ack_event(event, state)
+
+    telemetry_stop(start_time, telemetry_metadata, [])
 
     {:noreply, state, idle_timeout}
   end
@@ -184,37 +191,56 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
 
     %State{idle_timeout: idle_timeout} = state
 
+    telemetry_metadata = telemetry_metadata(event, state)
+    start_time = telemetry_start(telemetry_metadata)
+
     case handle_event(event, state) do
       {:error, error} ->
-        Logger.error(fn ->
-          describe(state) <>
-            " failed to handle event #{inspect(event_number)} due to: #{inspect(error)}"
-        end)
+        failure_context = build_failure_context(event, context, nil, state)
 
-        handle_event_error({:error, error}, event, state, context)
+        telemetry_stop(start_time, telemetry_metadata, {:error, error})
 
-      {:stop, _error, _state} = reply ->
-        reply
+        handle_event_error({:error, error}, event, failure_context, state)
+
+      {:error, error, stacktrace} ->
+        failure_context = build_failure_context(event, context, stacktrace, state)
+
+        telemetry_stop(start_time, telemetry_metadata, {:error, error, stacktrace})
+
+        handle_event_error({:error, error}, event, failure_context, state)
 
       commands ->
         # Copy event id, as causation id, and correlation id from handled event.
         opts = [causation_id: event_id, correlation_id: correlation_id, returning: false]
 
-        with :ok <- commands |> List.wrap() |> dispatch_commands(opts, state, event) do
-          process_state = mutate_state(event, state)
+        commands
+        |> List.wrap()
+        |> dispatch_commands(opts, state, event)
+        |> case do
+          :ok ->
+            telemetry_stop(start_time, telemetry_metadata, commands)
 
-          state = %State{
-            state
-            | process_state: process_state,
-              last_seen_event: event_number
-          }
+            case mutate_state(event, state) do
+              {:error, error, stacktrace} ->
+                failure_context = build_failure_context(event, context, stacktrace, state)
 
-          :ok = persist_state(event_number, state)
-          :ok = ack_event(event, state)
+                handle_event_error({:error, error}, event, failure_context, state)
 
-          {:noreply, state, idle_timeout}
-        else
+              process_state ->
+                state = %State{
+                  state
+                  | process_state: process_state,
+                    last_seen_event: event_number
+                }
+
+                :ok = persist_state(event_number, state)
+                :ok = ack_event(event, state)
+
+                {:noreply, state, idle_timeout}
+            end
+
           {:stop, reason} ->
+            telemetry_stop(start_time, telemetry_metadata, {:error, reason})
             {:stop, reason, state}
         end
     end
@@ -233,30 +259,67 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
     try do
       process_manager_module.handle(process_state, data)
     rescue
-      e -> {:error, e}
+      error ->
+        stacktrace = __STACKTRACE__
+        Logger.error(fn -> Exception.format(:error, error, stacktrace) end)
+
+        {:error, error, stacktrace}
     end
   end
 
-  defp handle_event_error(error, %RecordedEvent{} = failed_event, %State{} = state, context) do
+  defp build_failure_context(failed_event, context, stacktrace, state) do
+    %FailureContext{
+      context: context,
+      last_event: failed_event,
+      pending_commands: [],
+      process_manager_state: state,
+      stacktrace: stacktrace
+    }
+  end
+
+  defp handle_event_error(
+         {:error, reason} = error,
+         %RecordedEvent{} = failed_event,
+         %FailureContext{} = failure_context,
+         %State{} = state
+       ) do
     %RecordedEvent{data: data} = failed_event
     %State{idle_timeout: idle_timeout, process_manager_module: process_manager_module} = state
 
-    failure_context = %FailureContext{
-      pending_commands: [],
-      process_manager_state: state,
-      last_event: failed_event,
-      context: context
-    }
+    Logger.error(fn ->
+      describe(state) <>
+        " failed to handle event " <>
+        inspect(failed_event, pretty: true) <>
+        " due to: " <>
+        inspect(reason, pretty: true)
+    end)
 
     case process_manager_module.error(error, data, failure_context) do
+      {:retry, %FailureContext{context: context}} when is_map(context) ->
+        # Retry the failed event
+        Logger.info(fn -> describe(state) <> " is retrying failed event" end)
+
+        process_unseen_event(failed_event, state, context)
+
       {:retry, context} when is_map(context) ->
         # Retry the failed event
         Logger.info(fn -> describe(state) <> " is retrying failed event" end)
 
         process_unseen_event(failed_event, state, context)
 
+      {:retry, delay, %FailureContext{context: context}}
+      when is_map(context) and is_integer(delay) and delay >= 0 ->
+        # Retry the failed event after waiting for the given delay (milliseconds)
+        Logger.info(fn ->
+          describe(state) <> " is retrying failed event after #{inspect(delay)}ms"
+        end)
+
+        :timer.sleep(delay)
+
+        process_unseen_event(failed_event, state, context)
+
       {:retry, delay, context} when is_map(context) and is_integer(delay) and delay >= 0 ->
-        # Retry the failed event after waiting for the given delay, in milliseconds
+        # Retry the failed event after waiting for the given delay (milliseconds)
         Logger.info(fn ->
           describe(state) <> " is retrying failed event after #{inspect(delay)}ms"
         end)
@@ -298,7 +361,15 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
       process_state: process_state
     } = state
 
-    process_manager_module.apply(process_state, data)
+    try do
+      process_manager_module.apply(process_state, data)
+    rescue
+      error ->
+        stacktrace = __STACKTRACE__
+        Logger.error(fn -> Exception.format(:error, error, stacktrace) end)
+
+        {:error, error, stacktrace}
+    end
   end
 
   defp dispatch_commands(commands, opts, state, last_event, context \\ %{})
@@ -308,48 +379,68 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
     %State{application: application} = state
 
     Logger.debug(fn ->
-      describe(state) <> " attempting to dispatch command: #{inspect(command)}"
+      describe(state) <> " attempting to dispatch command: " <> inspect(command)
     end)
 
     case Application.dispatch(application, command, opts) do
       :ok ->
         dispatch_commands(pending_commands, opts, state, last_event)
 
-      error ->
+      {:error, _error} = error ->
         Logger.warn(fn ->
           describe(state) <>
-            " failed to dispatch command #{inspect(command)} due to: #{inspect(error)}"
+            " failed to dispatch command " <> inspect(command) <> " due to: " <> inspect(error)
         end)
+
+        process_manager_state =
+          case mutate_state(last_event, state) do
+            {:error, _, _} -> state
+            process_manager_state -> process_manager_state
+          end
 
         failure_context = %FailureContext{
           pending_commands: pending_commands,
-          process_manager_state: mutate_state(last_event, state),
+          process_manager_state: process_manager_state,
           last_event: last_event,
           context: context
         }
 
-        dispatch_failure(error, command, opts, state, failure_context)
+        dispatch_failure(error, command, opts, failure_context, state)
     end
   end
 
-  defp dispatch_failure(error, failed_command, opts, state, failure_context) do
+  defp dispatch_failure({:error, reason} = error, failed_command, opts, failure_context, state) do
     %State{process_manager_module: process_manager_module} = state
     %FailureContext{pending_commands: pending_commands, last_event: last_event} = failure_context
 
     case process_manager_module.error(error, failed_command, failure_context) do
-      {:continue, commands, context} when is_list(commands) ->
-        # continue dispatching the given commands
+      {:continue, commands, %FailureContext{context: context}}
+      when is_list(commands) and is_map(context) ->
+        # Continue dispatching the given commands
         Logger.info(fn -> describe(state) <> " is continuing with modified command(s)" end)
 
         dispatch_commands(commands, opts, state, last_event, context)
 
-      {:retry, context} ->
-        # retry the failed command immediately
+      {:continue, commands, context} when is_list(commands) and is_map(context) ->
+        # Continue dispatching the given commands
+        Logger.info(fn -> describe(state) <> " is continuing with modified command(s)" end)
+
+        dispatch_commands(commands, opts, state, last_event, context)
+
+      {:retry, %FailureContext{context: context}} when is_map(context) ->
+        # Retry the failed command immediately
         Logger.info(fn -> describe(state) <> " is retrying failed command" end)
 
         dispatch_commands([failed_command | pending_commands], opts, state, last_event, context)
 
-      {:retry, delay, context} when is_integer(delay) ->
+      {:retry, context} when is_map(context) ->
+        # Retry the failed command immediately
+        Logger.info(fn -> describe(state) <> " is retrying failed command" end)
+
+        dispatch_commands([failed_command | pending_commands], opts, state, last_event, context)
+
+      {:retry, delay, %FailureContext{context: context}}
+      when is_map(context) and is_integer(delay) and delay >= 0 ->
         # retry the failed command after waiting for the given delay, in milliseconds
         Logger.info(fn ->
           describe(state) <> " is retrying failed command after #{inspect(delay)}ms"
@@ -359,8 +450,30 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
 
         dispatch_commands([failed_command | pending_commands], opts, state, last_event, context)
 
+      {:retry, delay, context} when is_map(context) and is_integer(delay) and delay >= 0 ->
+        # retry the failed command after waiting for the given delay, in milliseconds
+        Logger.info(fn ->
+          describe(state) <> " is retrying failed command after #{inspect(delay)}ms"
+        end)
+
+        :timer.sleep(delay)
+
+        dispatch_commands([failed_command | pending_commands], opts, state, last_event, context)
+
+      :skip ->
+        # Skip the failed command, but continue dispatching any pending commands
+        Logger.info(fn -> describe(state) <> " is ignoring error dispatching command" end)
+
+        dispatch_commands(pending_commands, opts, state, last_event)
+
+      {:skip, :continue_pending} ->
+        # Skip the failed command, but continue dispatching any pending commands
+        Logger.info(fn -> describe(state) <> " is ignoring error dispatching command" end)
+
+        dispatch_commands(pending_commands, opts, state, last_event)
+
       {:skip, :discard_pending} ->
-        # skip the failed command and discard any pending commands
+        # Skip the failed command and discard any pending commands
         Logger.info(fn ->
           describe(state) <>
             " is skipping event and #{length(pending_commands)} pending command(s)"
@@ -368,17 +481,19 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
 
         :ok
 
-      {:skip, :continue_pending} ->
-        # skip the failed command, but continue dispatching any pending commands
-        Logger.info(fn -> describe(state) <> " is ignoring error dispatching command" end)
-
-        dispatch_commands(pending_commands, opts, state, last_event)
-
       {:stop, reason} = reply ->
-        # stop process manager
+        # Stop process manager
         Logger.warn(fn -> describe(state) <> " has requested to stop: #{inspect(reason)}" end)
 
         reply
+
+      invalid ->
+        Logger.warn(fn ->
+          describe(state) <> " returned an invalid error response: #{inspect(invalid)}"
+        end)
+
+        # Stop process manager with original error reason
+        {:stop, reason}
     end
   end
 
@@ -418,5 +533,54 @@ defmodule Commanded.ProcessManagers.ProcessManagerInstance do
     %State{process_manager_name: process_manager_name, process_uuid: process_uuid} = state
 
     inspect(process_manager_name) <> "-" <> inspect(process_uuid)
+  end
+
+  defp telemetry_start(telemetry_metadata) do
+    Telemetry.start([:commanded, :process_manager, :handle], telemetry_metadata)
+  end
+
+  defp telemetry_stop(start_time, telemetry_metadata, handle_result) do
+    event_prefix = [:commanded, :process_manager, :handle]
+
+    case handle_result do
+      {:error, error} ->
+        telemetry_metadata =
+          telemetry_metadata
+          |> Map.put(:error, error)
+          |> Map.put_new(:commands, [])
+
+        Telemetry.stop(event_prefix, start_time, telemetry_metadata)
+
+      {:error, error, stacktrace} ->
+        Telemetry.exception(
+          event_prefix,
+          start_time,
+          :error,
+          error,
+          stacktrace,
+          telemetry_metadata
+        )
+
+      commands ->
+        commands = List.wrap(commands)
+
+        telemetry_metadata =
+          telemetry_metadata |> Map.put(:commands, commands) |> Map.put(:error, nil)
+
+        Telemetry.stop(event_prefix, start_time, telemetry_metadata)
+    end
+  end
+
+  defp telemetry_metadata(%RecordedEvent{} = event, %State{} = state) do
+    state
+    |> Map.from_struct()
+    |> Map.take([
+      :application,
+      :process_manager_name,
+      :process_manager_module,
+      :process_state,
+      :process_uuid
+    ])
+    |> Map.put(:recorded_event, event)
   end
 end
