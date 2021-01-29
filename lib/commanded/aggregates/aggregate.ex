@@ -544,8 +544,8 @@ defmodule Commanded.Aggregates.Aggregate do
         correlation_id: correlation_id,
         metadata: metadata
       )
-
-    EventStore.append_to_stream(application, aggregate_uuid, expected_version, event_data)
+	#DJE - turning off all version checking to work around a problem in production
+    EventStore.append_to_stream(application, aggregate_uuid, :any_version, event_data)
   end
 
   defp via_name(application, aggregate_module, aggregate_uuid) do
